@@ -10,9 +10,18 @@ import { VIEWER } from './scenario.ts';
 /** Fixed epoch for every timestamp the store emits (2025-01-01T00:00:00Z). */
 export const STORE_EPOCH_SEC = 1_735_689_600;
 
+/** Memoized ISO timestamps: isoAt is pure (epoch + seq), and the same seq values are
+ * formatted on every render of the same repo/issue/pull, so repeat calls are free. */
+const isoCache = new Map<number, string>();
+
 /** Format a sequence as an ISO-8601 UTC timestamp (deterministic). */
 export function isoAt(seq: number): string {
-  return new Date((STORE_EPOCH_SEC + seq) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const cached = isoCache.get(seq);
+  if (cached !== undefined) return cached;
+  const text = new Date((STORE_EPOCH_SEC + seq) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  if (isoCache.size > 10000) isoCache.clear();
+  isoCache.set(seq, text);
+  return text;
 }
 
 /** Format a sequence as a git timestamp line ("<epoch> +0000"). */

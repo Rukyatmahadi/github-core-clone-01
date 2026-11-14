@@ -227,49 +227,21 @@ function readOfsVarint(buf: Buffer, start: number): { value: number; next: numbe
 
 /** Inflate the zlib stream at `offset`; returns the data and the offset just past the stream. */
 export function inflateAt(buf: Buffer, offset: number): { data: Buffer; next: number } {
-  // inflateSync needs the exact stream; find its end by trying increasing lengths is too slow,
-  // so use the zlib header + a streaming inflate via a manual approach: Node's inflateSync on a
-  // slice works when the slice ends exactly at the stream end. We locate the end with
-  // `zlib.inflateSync` on progressively grown slices is O(n^2); instead use the fact that the
-  // deflate stream is followed by either another object or the 20-byte trailer, and scan for the
-  // first offset where inflateSync succeeds AND the consumed length matches. Node exposes the
-  // consumed bytes only through zlib.createInflate with `bytesWritten`... simpler: use
-  // createInflate and feed the whole rest, tracking total output vs input consumed via the
-  // 'data'/'end' events is async. Synchronous approach: try inflateSync on buf[offset..end]
-  // for end = offset+2 .. buf.length is too slow for big packs, but our packs are small
-  // (the suite's pushes are at most 100 files of ~4KB). Use a binary search on the end offset:
-  // inflateSync throws on truncated input and succeeds (possibly with trailing garbage ignored?
-  // no — inflateSync throws on trailing data? Actually inflateSync ignores trailing bytes after
-  // the stream end? No: it throws "incorrect data check" only for corrupt data; trailing bytes
-  // after a complete stream are IGNORED by inflateSync? Testing shows inflateSync returns the
-  // inflated data and ignores trailing garbage. So inflate the whole remainder once and find
-  // the true end by re-deflating? No. Use createInflateSync? Not available.
-  // Practical approach: inflateSync(buf.subarray(offset)) ignores trailing bytes, and we
-  // recover the consumed input length by deflating the result at the same level and comparing
-  // lengths — unreliable across levels. Instead, scan: the zlib stream ends with the adler32
-  // (4 bytes) and the deflate final block bit; a cheap exact method is to walk the stream with
-  // a bit reader — overkill. Use binary search on end offset with inflateSync: it throws while
-  // truncated, succeeds once complete (it ignores trailing bytes, so success at the FIRST
-  // complete end is what binary search finds if we test "does it throw").
-  let lo = offset + 2;
-  let hi = buf.length;
-  // First verify the whole remainder inflates at all.
+  // inflateSync with { info: true } reports the input bytes the stream consumed
+  // (engine.bytesWritten), so one inflate finds the stream's end exactly — no binary
+  // search over end offsets, and no throws from probing truncated slices.
+  let result: { buffer: Buffer; engine: { bytesWritten: number } };
   try {
-    inflateSync(buf.subarray(offset));
+    result = inflateSync(buf.subarray(offset), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
   } catch {
     throw new Error('pack entry zlib stream is corrupt');
   }
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      inflateSync(buf.subarray(offset, mid));
-      hi = mid;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  const data = inflateSync(buf.subarray(offset, lo));
-  return { data, next: lo };
+  const written = result.engine.bytesWritten;
+  if (!written || written <= 0) throw new Error('pack entry zlib stream consumed no bytes');
+  return { data: result.buffer, next: offset + written };
 }
 
 /** Apply a git delta to a base buffer, returning the reconstructed object. */

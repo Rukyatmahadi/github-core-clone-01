@@ -47,8 +47,7 @@ export const store = new Store();
 /** Request ids are a counter: deterministic across runs fed the same requests. */
 let requestSeq = 0;
 
-function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+function sendText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
   requestSeq += 1;
   res.writeHead(status, {
     'content-type': JSON_TYPE,
@@ -57,6 +56,22 @@ function sendJson(res: ServerResponse, status: number, body: unknown, headers: R
     ...headers,
   });
   res.end(text);
+}
+
+/** Send a pre-serialized JSON Buffer: skips stringify and the UTF-8 encode (res.end(Buffer)). */
+function sendBuffer(res: ServerResponse, status: number, body: Buffer, headers: Readonly<Record<string, string>> = {}): void {
+  requestSeq += 1;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': body.length,
+    'x-github-request-id': `req-${requestSeq}`,
+    ...headers,
+  });
+  res.end(body);
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
+  sendText(res, status, `${JSON.stringify(body)}\n`, headers);
 }
 
 function notFound(res: ServerResponse, message = 'Not Found'): void {
@@ -75,21 +90,21 @@ function unprocessable(res: ServerResponse, message: string): void {
   sendJson(res, 422, { message });
 }
 
-/** The request's path segments, percent-decoded, without empty parts. */
-function pathSegments(req: IncomingMessage): string[] {
+/** Parse the request URL once (pathSegments and the query share it: one `new URL` per request). */
+function requestUrl(req: IncomingMessage): URL {
   try {
-    const url = new URL(req.url ?? '/', 'http://entry');
-    return url.pathname.split('/').filter((part) => part !== '').map((part) => decodeURIComponent(part));
+    return new URL(req.url ?? '/', 'http://entry');
   } catch {
-    return [];
+    return new URL('/', 'http://entry');
   }
 }
 
-function queryOf(req: IncomingMessage): URLSearchParams {
+/** The request's path segments, percent-decoded, without empty parts. */
+function pathSegments(url: URL): string[] {
   try {
-    return new URL(req.url ?? '/', 'http://entry').searchParams;
+    return url.pathname.split('/').filter((part) => part !== '').map((part) => decodeURIComponent(part));
   } catch {
-    return new URLSearchParams();
+    return [];
   }
 }
 
@@ -230,6 +245,38 @@ function issueJson(repo: Repo, issue: Issue): Record<string, unknown> {
   };
 }
 
+/**
+ * Serialized GET /issues/{n} responses, keyed by a fingerprint of every field issueJson
+ * renders. The fingerprint covers id, number, title, body, state, each label's name and
+ * color (label colors are immutable once created: createLabel returns the existing label
+ * for a name, and no endpoint updates or deletes a label), the comment count, both
+ * sequences, and the repo identity — so any mutation that could change the rendered
+ * JSON changes the fingerprint and the cache misses. The request id stays per-request
+ * (it lives in the header, not the cached body). Bounded: cleared past 5,000 entries.
+ */
+const issueJsonCache = new Map<string, Buffer>();
+
+function issueFingerprint(repo: Repo, issue: Issue): string {
+  const labelParts = issue.labels.map((name) => {
+    const label = repo.labels.find((l) => l.name === name);
+    return label === undefined ? `${name}:ededed` : `${name}:${label.color}`;
+  });
+  // JSON-encoded (not separator-joined): titles and bodies may contain any character.
+  return JSON.stringify([
+    repo.owner,
+    repo.name,
+    issue.number,
+    issue.id,
+    issue.title,
+    issue.body,
+    issue.state,
+    labelParts,
+    issue.comments.length,
+    issue.createdSeq,
+    issue.closedSeq,
+  ]);
+}
+
 function commentJson(repo: Repo, issue: Issue, comment: Comment): Record<string, unknown> {
   return {
     id: comment.id,
@@ -319,8 +366,9 @@ function lookupRepo(res: ServerResponse, segments: string[], ownerIdx: number): 
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  const segments = pathSegments(req);
-  const query = queryOf(req);
+  const url = requestUrl(req);
+  const segments = pathSegments(url);
+  const query = url.searchParams;
 
   // Health probe: no auth.
   if (method === 'GET' && segments.length === 1 && segments[0] === 'healthz') {
@@ -776,7 +824,16 @@ async function handleIssues(
   // /issues/{n}
   if (tail.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, issueJson(repo, issue));
+      const key = issueFingerprint(repo, issue);
+      const cached = issueJsonCache.get(key);
+      if (cached !== undefined) {
+        sendBuffer(res, 200, cached);
+        return;
+      }
+      const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+      if (issueJsonCache.size > 5000) issueJsonCache.clear();
+      issueJsonCache.set(key, body);
+      sendBuffer(res, 200, body);
       return;
     }
     if (method === 'PATCH') {

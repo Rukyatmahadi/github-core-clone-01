@@ -165,7 +165,7 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
       }
       chunks.push(chunk);
     });
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -655,6 +655,9 @@ const ACK_SECTION_NAK: Buffer = pktLines(['acknowledgments\n', 'NAK\n', 'flush']
  */
 const packSectionCache = new WeakMap<FetchPlan, Buffer>();
 
+/** Shallow-info sections, keyed by the memoized fetch plan (same rationale). */
+const shallowSectionCache = new WeakMap<FetchPlan, Buffer>();
+
 async function handleUploadPackV2(
   _req: IncomingMessage,
   res: ServerResponse,
@@ -726,10 +729,15 @@ async function handleUploadPackV2(
     }
     // shallow-info (only when this fetch is shallow-related)
     if (depth !== null || shallow.length > 0) {
-      const shallowLines: string[] = [];
-      for (const oid of plan.shallow) shallowLines.push(`shallow ${oid}\n`);
-      for (const oid of plan.unshallow) shallowLines.push(`unshallow ${oid}\n`);
-      sections.push(pktLines(['shallow-info\n', ...shallowLines, 'flush']));
+      let shallowSection = shallowSectionCache.get(plan);
+      if (shallowSection === undefined) {
+        const shallowLines: string[] = [];
+        for (const oid of plan.shallow) shallowLines.push(`shallow ${oid}\n`);
+        for (const oid of plan.unshallow) shallowLines.push(`unshallow ${oid}\n`);
+        shallowSection = pktLines(['shallow-info\n', ...shallowLines, 'flush']);
+        shallowSectionCache.set(plan, shallowSection);
+      }
+      sections.push(shallowSection);
     }
     // packfile (omitted entirely when nothing is delivered)
     if (plan.objects.size > 0) {

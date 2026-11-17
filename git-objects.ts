@@ -370,6 +370,13 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
   return { objects, count };
 }
 
+/** Deflated-entry cache: complete pack entry (varint header + deflated payload) per oid.
+ *  Clone workloads re-pack the same tip commit / tree / blob for every concurrent clone,
+ *  so caching the finished entry avoids re-deflating identical objects. Bounded: cleared
+ *  once it grows past 5,000 entries to cap memory. */
+const deflatedEntryCache = new Map<string, Buffer>();
+const DEFLATED_ENTRY_CACHE_MAX = 5000;
+
 /** Write a packfile (version 2) holding the given objects whole (no deltas). */
 export function writePack(objects: Iterable<GitObject>): Buffer {
   const list = [...objects];
@@ -380,6 +387,12 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
   const parts: Buffer[] = [header];
   const TYPE_NUMS: Record<GitObjectType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
   for (const obj of list) {
+    const oid = hashObject(obj.type, obj.data);
+    const cached = deflatedEntryCache.get(oid);
+    if (cached !== undefined) {
+      parts.push(cached);
+      continue;
+    }
     const size = obj.data.length;
     const typeNum = TYPE_NUMS[obj.type];
     // varint header: first byte holds type in bits 4-6 and low 4 size bits, MSB continuation.
@@ -395,8 +408,11 @@ export function writePack(objects: Iterable<GitObject>): Buffer {
       if (remaining > 0) byte |= 0x80;
       headerBytes.push(byte);
     }
-    parts.push(Buffer.from(headerBytes));
-    parts.push(deflateSync(obj.data));
+    // The cached entry is the COMPLETE entry: header + deflated payload, emitted once.
+    const entry = Buffer.concat([Buffer.from(headerBytes), deflateSync(obj.data)]);
+    if (deflatedEntryCache.size >= DEFLATED_ENTRY_CACHE_MAX) deflatedEntryCache.clear();
+    deflatedEntryCache.set(oid, entry);
+    parts.push(entry);
   }
   const body = Buffer.concat(parts);
   const trailer = createHash('sha1').update(body).digest();

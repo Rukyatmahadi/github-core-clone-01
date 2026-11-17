@@ -58,6 +58,28 @@ function pktLines(parts: readonly (string | Buffer | 'flush' | 'delim')[]): Buff
   return Buffer.concat(out);
 }
 
+/** Hex value of one ASCII hex digit, or -1 (pkt-line length headers). */
+function hexVal(b: number): number {
+  if (b >= 0x30 && b <= 0x39) return b - 0x30;
+  if (b >= 0x61 && b <= 0x66) return b - 0x61 + 10;
+  if (b >= 0x41 && b <= 0x46) return b - 0x41 + 10;
+  return -1;
+}
+
+/**
+ * Read a pkt-line length header at `pos` (4 hex digits), byte-identical to the
+ * old toString + regex + parseInt path (same throws, same values) without the
+ * string allocation. Callers guarantee pos + 4 <= buf.length.
+ */
+function readPktLen(buf: Buffer, pos: number): number {
+  const h0 = hexVal(buf[pos] as number);
+  const h1 = hexVal(buf[pos + 1] as number);
+  const h2 = hexVal(buf[pos + 2] as number);
+  const h3 = hexVal(buf[pos + 3] as number);
+  if (h0 < 0 || h1 < 0 || h2 < 0 || h3 < 0) throw new Error('bad pkt-line header');
+  return (h0 << 12) | (h1 << 8) | (h2 << 4) | h3;
+}
+
 type Pkt = { kind: 'data' | 'flush' | 'delim' | 'response-end'; payload: Buffer };
 
 /** Decode a whole pkt-line stream. Throws on a bad header / truncation. */
@@ -66,9 +88,7 @@ function decodePkts(buf: Buffer): Pkt[] {
   let pos = 0;
   while (pos < buf.length) {
     if (pos + 4 > buf.length) throw new Error('truncated pkt-line');
-    const head = buf.subarray(pos, pos + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('bad pkt-line header');
-    const len = Number.parseInt(head, 16);
+    const len = readPktLen(buf, pos);
     if (len === 0) { out.push({ kind: 'flush', payload: Buffer.alloc(0) }); pos += 4; continue; }
     if (len === 1) { out.push({ kind: 'delim', payload: Buffer.alloc(0) }); pos += 4; continue; }
     if (len === 2) { out.push({ kind: 'response-end', payload: Buffer.alloc(0) }); pos += 4; continue; }
@@ -87,9 +107,7 @@ function decodePktsToFlush(buf: Buffer): { packets: Pkt[]; consumed: number } {
   let pos = 0;
   while (pos < buf.length) {
     if (pos + 4 > buf.length) throw new Error('truncated pkt-line');
-    const head = buf.subarray(pos, pos + 4).toString('ascii');
-    if (!/^[0-9a-fA-F]{4}$/.test(head)) throw new Error('bad pkt-line header');
-    const len = Number.parseInt(head, 16);
+    const len = readPktLen(buf, pos);
     if (len === 0) { packets.push({ kind: 'flush', payload: Buffer.alloc(0) }); return { packets, consumed: pos + 4 }; }
     if (len === 1) { packets.push({ kind: 'delim', payload: Buffer.alloc(0) }); pos += 4; continue; }
     if (len === 2) { packets.push({ kind: 'response-end', payload: Buffer.alloc(0) }); pos += 4; continue; }
@@ -626,9 +644,16 @@ async function handleGitHttpInner(
 const lsRefsCache = new Map<string, Buffer>();
 const LS_REFS_CACHE_MAX = 200;
 
-/** Whole framed packfile sections, keyed by the ordered oid set (clone #1). */
-const packSectionCache = new Map<string, Buffer>();
-const PACK_SECTION_CACHE_MAX = 200;
+/** Prebuilt acknowledgments section for fetches with no haves (the clone case). */
+const ACK_SECTION_NAK: Buffer = pktLines(['acknowledgments\n', 'NAK\n', 'flush']);
+
+/**
+ * Whole framed packfile sections, keyed by the memoized fetch plan object.
+ * The section is a pure function of the plan's ordered object set (objects are
+ * immutable), and the plan objects are the memoized ones, so the WeakMap entry
+ * is exact; entries die with the plan, and the plan cache is bounded.
+ */
+const packSectionCache = new WeakMap<FetchPlan, Buffer>();
 
 async function handleUploadPackV2(
   _req: IncomingMessage,
@@ -687,18 +712,18 @@ async function handleUploadPackV2(
     }
     const plan = planFetch(repo, wants, haves, shallow, depth);
     const sections: Buffer[] = [];
-    // acknowledgments
-    const ackLines: string[] = [];
-    if (haves.length > 0) {
+    // acknowledgments (the no-haves NAK section is constant — prebuilt)
+    if (haves.length === 0) {
+      sections.push(ACK_SECTION_NAK);
+    } else {
+      const ackLines: string[] = [];
       for (const have of haves) {
         if (repo.objects.has(have)) ackLines.push(`ACK ${have}\n`);
       }
       if (ackLines.length > 0) ackLines.push('ready\n');
       else ackLines.push('NAK\n');
-    } else {
-      ackLines.push('NAK\n');
+      sections.push(pktLines(['acknowledgments\n', ...ackLines, 'flush']));
     }
-    sections.push(pktLines(['acknowledgments\n', ...ackLines, 'flush']));
     // shallow-info (only when this fetch is shallow-related)
     if (depth !== null || shallow.length > 0) {
       const shallowLines: string[] = [];
@@ -710,18 +735,16 @@ async function handleUploadPackV2(
     if (plan.objects.size > 0) {
       // The whole framed section (packfile header + sideband packets + flush) is a
       // pure function of the ordered object set, and objects are immutable, so it
-      // is cached per ordered oid list — this skips writePack, framing and concats
+      // is cached per fetch plan — this skips writePack, framing and concats
       // on a hit (all 50 clones in a round fetch the identical 3-object set).
-      const packKey = [...plan.objects.keys()].join(',');
-      let section = packSectionCache.get(packKey);
+      let section = packSectionCache.get(plan);
       if (section === undefined) {
         const pack = writePack(plan.objects.values());
         const sb: Buffer[] = [pktLine('packfile\n')];
         for (const packet of sidebandPackets(1, pack)) sb.push(packet);
         sb.push(FLUSH);
         section = Buffer.concat(sb);
-        if (packSectionCache.size >= PACK_SECTION_CACHE_MAX) packSectionCache.clear();
-        packSectionCache.set(packKey, section);
+        packSectionCache.set(plan, section);
       }
       sections.push(section);
     }

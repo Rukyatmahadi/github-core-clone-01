@@ -86,11 +86,28 @@ export interface Issue {
   createdSeq: number;
   closedSeq: number | null;
   /**
-   * Bumped on every mutation of a field the REST issue fingerprint renders
-   * (title/body/state/closedSeq/comments) — see app.ts issueFingerprint memo.
-   * Label names/colors never change after creation, so they need no bump.
+   * Serialized GET /issues/{n} response, with a snapshot of every field the
+   * rendering reads (see app.ts issueResponseBuffer). The snapshot check is a
+   * few reference/number compares — an unchanged title/body is a pointer
+   * compare, since strings are immutable — so a cache hit costs ~nothing, and
+   * any mutation path (REST PATCH, GraphQL close, comment creation) changes a
+   * snapshotted field and the next read rebuilds. Labels are immutable once
+   * created and an issue's label names are fixed at creation (labels are
+   * copied into the issue in createIssue and never written after; createLabel
+   * returns the existing label for a name and no endpoint updates or deletes
+   * a label), so they need no snapshot entry. Null until the first render.
    */
-  fpVersion: number;
+  jsonCache: IssueJsonCache | null;
+}
+
+/** Snapshot + bytes for one issue's rendered JSON (see Issue.jsonCache). */
+export interface IssueJsonCache {
+  body: Buffer;
+  title: string;
+  bodyText: string;
+  state: 'open' | 'closed';
+  closedSeq: number | null;
+  commentCount: number;
 }
 
 export interface PullFile {
@@ -513,7 +530,7 @@ export class Store {
       comments: [],
       createdSeq: this.nextSeq(),
       closedSeq: null,
-      fpVersion: 0,
+      jsonCache: null,
     };
     this.nextObjectId += 1;
     repo.nextIssueNumber += 1;
@@ -538,7 +555,6 @@ export class Store {
     const comment: Comment = { id: this.nextCommentId, body, createdSeq: this.nextSeq() };
     this.nextCommentId += 1;
     issue.comments.push(comment);
-    issue.fpVersion += 1;
     return comment;
   }
 

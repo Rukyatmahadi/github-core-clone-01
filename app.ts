@@ -351,53 +351,43 @@ function slimIssueJson(repo: Repo, issue: Issue): Record<string, unknown> {
 }
 
 /**
- * Serialized GET /issues/{n} responses, keyed by a fingerprint of every field issueJson
- * renders. The fingerprint covers id, number, title, body, state, each label's name and
- * color (label colors are immutable once created: createLabel returns the existing label
- * for a name, and no endpoint updates or deletes a label), the comment count, both
- * sequences, and the repo identity — so any mutation that could change the rendered
- * JSON changes the fingerprint and the cache misses. The request id stays per-request
- * (it lives in the header, not the cached body). Bounded: cleared past 5,000 entries.
+ * The serialized GET /issues/{n} response for one issue, cached on the issue
+ * itself with a snapshot of every field the rendering reads (Track B,
+ * replacing r4's memoized fingerprint cache, which paid a JSON.stringify per
+ * GET to build the fingerprint key). The snapshot check is a few
+ * reference/number compares — an unchanged title/body is a pointer compare,
+ * since strings are immutable — so a hit costs ~nothing, and any mutation
+ * path (REST PATCH, GraphQL close, comment creation) changes a snapshotted
+ * field and the next read rebuilds. Byte-identical to
+ * `${JSON.stringify(issueJson(...))}\n` (what sendJson emits). Every other
+ * field issueJson renders is immutable or constant: id/number/createdSeq are
+ * fixed at creation; labels are fixed at creation with immutable colors
+ * (verified: no write to issue.labels or label.color anywhere; GraphQL has
+ * no label mutation); node_id/html_url/url derive from the repo identity,
+ * which is never renamed; user is the constant viewer; assignee(s) are null/[].
  */
-const issueJsonCache = new Map<string, Buffer>();
-
-/**
- * Memoized issue fingerprints (read #2): the fingerprint is a JSON.stringify over
- * every rendered field, recomputed on every GET even though the cache hits 99.9%
- * of the time. The memo is keyed by the issue object plus its fpVersion counter,
- * bumped in exactly the mutation sites (REST PATCH, GraphQL closeIssue,
- * Store.createComment) — any missed mutation would serve a stale body, which the
- * issues.* conformance checks gate on.
- */
-const issueFingerprintMemo = new WeakMap<Issue, { version: number; fingerprint: string }>();
-
-function memoizedIssueFingerprint(repo: Repo, issue: Issue): string {
-  const memo = issueFingerprintMemo.get(issue);
-  if (memo !== undefined && memo.version === issue.fpVersion) return memo.fingerprint;
-  const fingerprint = issueFingerprint(repo, issue);
-  issueFingerprintMemo.set(issue, { version: issue.fpVersion, fingerprint });
-  return fingerprint;
-}
-
-function issueFingerprint(repo: Repo, issue: Issue): string {
-  const labelParts = issue.labels.map((name) => {
-    const label = repo.labels.find((l) => l.name === name);
-    return label === undefined ? `${name}:ededed` : `${name}:${label.color}`;
-  });
-  // JSON-encoded (not separator-joined): titles and bodies may contain any character.
-  return JSON.stringify([
-    repo.owner,
-    repo.name,
-    issue.number,
-    issue.id,
-    issue.title,
-    issue.body,
-    issue.state,
-    labelParts,
-    issue.comments.length,
-    issue.createdSeq,
-    issue.closedSeq,
-  ]);
+function issueResponseBuffer(repo: Repo, issue: Issue): Buffer {
+  const cached = issue.jsonCache;
+  if (
+    cached !== null &&
+    cached.title === issue.title &&
+    cached.bodyText === issue.body &&
+    cached.state === issue.state &&
+    cached.closedSeq === issue.closedSeq &&
+    cached.commentCount === issue.comments.length
+  ) {
+    return cached.body;
+  }
+  const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  issue.jsonCache = {
+    body,
+    title: issue.title,
+    bodyText: issue.body,
+    state: issue.state,
+    closedSeq: issue.closedSeq,
+    commentCount: issue.comments.length,
+  };
+  return body;
 }
 
 function commentJson(repo: Repo, issue: Issue, comment: Comment): Record<string, unknown> {
@@ -487,18 +477,9 @@ function lookupRepo(res: ServerResponse, segments: string[], ownerIdx: number): 
   return repo;
 }
 
-/** Serve GET /repos/{o}/{r}/issues/{n} (cached body when the fingerprint hits). */
+/** Serve GET /repos/{o}/{r}/issues/{n} (per-issue cached body). */
 function serveIssueGet(res: ServerResponse, repo: Repo, issue: Issue): void {
-  const key = memoizedIssueFingerprint(repo, issue);
-  const cached = issueJsonCache.get(key);
-  if (cached !== undefined) {
-    sendBuffer(res, 200, cached);
-    return;
-  }
-  const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
-  if (issueJsonCache.size > 5000) issueJsonCache.clear();
-  issueJsonCache.set(key, body);
-  sendBuffer(res, 200, body);
+  sendBuffer(res, 200, issueResponseBuffer(repo, issue));
 }
 
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -996,8 +977,9 @@ async function handleIssues(
       if (typeof title === 'string') issue.title = title;
       const issueBody = body.body;
       if (typeof issueBody === 'string') issue.body = issueBody;
-      issue.fpVersion += 1;
-      sendJson(res, 200, issueJson(repo, issue));
+      // issueResponseBuffer rebuilds on the changed snapshot fields and stores
+      // the new bytes, so the next GET hits; byte-identical to sendJson(issueJson).
+      sendBuffer(res, 200, issueResponseBuffer(repo, issue));
       return;
     }
     notFound(res);

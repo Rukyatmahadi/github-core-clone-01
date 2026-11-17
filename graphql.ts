@@ -860,7 +860,6 @@ function resolveField(
       if (repo === undefined || issue === undefined) throw new FieldError('issue not found');
       issue.state = 'closed';
       issue.closedSeq = store.nextSeq();
-      issue.fpVersion += 1;
       return { __gqlType: 'CloseIssuePayload', issue: { __nodeType: 'Issue', target: issue, repo }, repo };
     }
     if (fieldName === 'createPullRequest') {

@@ -656,15 +656,19 @@ const LS_REFS_CACHE_MAX = 200;
 const ACK_SECTION_NAK: Buffer = pktLines(['acknowledgments\n', 'NAK\n', 'flush']);
 
 /**
- * Whole v2 fetch responses, keyed by the memoized fetch plan object. The
- * response (acknowledgments + shallow-info + packfile sections) is a pure
- * function of the plan — the plan memo key already includes the repo git
- * version and the full arg set, and objects are immutable — so the cached
- * response is exact. This subsumes the per-section caches: on a hit the fetch
- * is one cache lookup + one send. Entries die with the plan; the plan cache
- * is bounded.
+ * Whole v2 fetch responses, keyed by repo + git version + wants + haves +
+ * shallow + depth (Track B's single-lookup string key, checked BEFORE
+ * planFetch, so a hit skips planFetch entirely — C7's WeakMap<plan> needed the
+ * plan first, i.e. a key build + Map lookup + WeakMap lookup per hit). The git
+ * version stays in the key (from C7): it bumps on every objects/refs mutation,
+ * so a cached response can never be stale — in particular the ACK section,
+ * which depends on haves' existence. Stored only when every want exists
+ * (Track B's guard): a want created later must not be shadowed by an earlier
+ * empty answer. Objects are immutable, so a stored answer stays right.
+ * Bounded: cleared past 200 entries.
  */
-const fetchResponseCache = new WeakMap<FetchPlan, Buffer>();
+const fetchResponseCache = new Map<string, Buffer>();
+const FETCH_RESPONSE_CACHE_MAX = 200;
 
 async function handleUploadPackV2(
   _req: IncomingMessage,
@@ -721,12 +725,13 @@ async function handleUploadPackV2(
       }
       // thin-pack / no-progress / ofs-delta / filter / deepen-since / deepen-not / done: accepted, ignored.
     }
-    const plan = planFetch(repo, wants, haves, shallow, depth);
-    const cachedResponse = fetchResponseCache.get(plan);
-    if (cachedResponse !== undefined) {
-      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cachedResponse);
+    const fetchKey = `${repo.id}|${repo.gitVersion}|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth}`;
+    const cachedFetch = fetchResponseCache.get(fetchKey);
+    if (cachedFetch !== undefined) {
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cachedFetch);
       return;
     }
+    const plan = planFetch(repo, wants, haves, shallow, depth);
     const sections: Buffer[] = [];
     // acknowledgments (the no-haves NAK section is constant — prebuilt)
     if (haves.length === 0) {
@@ -756,7 +761,13 @@ async function handleUploadPackV2(
       sections.push(Buffer.concat(sb));
     }
     const response = Buffer.concat(sections);
-    fetchResponseCache.set(plan, response);
+    // Cache only when every want exists: a want created later must not be
+    // shadowed by an earlier empty answer. Objects are immutable, so a stored
+    // answer stays right.
+    if (wants.every((want) => repo.objects.has(want))) {
+      if (fetchResponseCache.size >= FETCH_RESPONSE_CACHE_MAX) fetchResponseCache.clear();
+      fetchResponseCache.set(fetchKey, response);
+    }
     sendBuffer(res, 200, 'application/x-git-upload-pack-result', response);
     return;
   }

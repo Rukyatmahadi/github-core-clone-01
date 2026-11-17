@@ -573,6 +573,25 @@ function parseV2Command(body: Buffer): V2Command {
   return { command, args };
 }
 
+// Sniff the v2 command from the FIRST pkt-line only, without decoding the whole
+// body. The protocol puts `command=<cmd>` first, so a well-formed request is
+// identified in O(1). Returns null for malformed bodies or unusual ordering —
+// callers fall back to the full parseV2Command path, which stays authoritative.
+function sniffV2Command(body: Buffer): 'fetch' | 'ls-refs' | null {
+  if (body.length < 4) return null;
+  let len: number;
+  try {
+    len = readPktLen(body, 0);
+  } catch {
+    return null;
+  }
+  if (len <= 4 || len > body.length) return null;
+  const first = body.toString('utf8', 4, len);
+  if (first === 'command=fetch\n' || first === 'command=fetch') return 'fetch';
+  if (first === 'command=ls-refs\n' || first === 'command=ls-refs') return 'ls-refs';
+  return null;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Handlers
 
@@ -676,6 +695,28 @@ async function handleUploadPackV2(
   repo: Repo,
   body: Buffer,
 ): Promise<void> {
+  // Body-keyed fast path (attempt 2): the clone workload repeats byte-identical
+  // fetch/ls-refs bodies (same want, same deepen) against an unchanged repo.
+  // The raw body is an exact key for the response: repo.id + gitVersion cover
+  // repo state (gitVersion bumps on every objects/refs mutation — store.ts
+  // putObject/commitFileChange/merge + git-http/app ref writes), and the body
+  // carries the full command + args. A hit skips parseV2Command entirely
+  // (decodePkts + lines array + find/filter/map with regex) and the arg loop +
+  // key joins — the hottest per-request allocation on the clone path. A miss
+  // falls through to the full path, which stores under the same body key.
+  // (Bodies differing only in arg order or agent string just get separate
+  // entries — a miss, never a wrong hit.)
+  let bodyKey: string | null = null;
+  const sniffed = sniffV2Command(body);
+  if (sniffed === 'fetch' || sniffed === 'ls-refs') {
+    bodyKey = `${repo.id}|${repo.gitVersion}|${body.toString('utf8')}`;
+    const cache = sniffed === 'fetch' ? fetchResponseCache : lsRefsCache;
+    const cached = cache.get(bodyKey);
+    if (cached !== undefined) {
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cached);
+      return;
+    }
+  }
   const { command, args } = parseV2Command(body);
   if (command === 'ls-refs') {
     const opts = { peel: false, symrefs: false, unborn: false, prefixes: [] as string[] };
@@ -685,7 +726,7 @@ async function handleUploadPackV2(
       else if (arg === 'unborn') opts.unborn = true;
       else if (arg.startsWith('ref-prefix ')) opts.prefixes.push(arg.slice('ref-prefix '.length));
     }
-    const lsKey = `${repo.id}|${repo.gitVersion}|${opts.peel}|${opts.symrefs}|${opts.unborn}|${opts.prefixes.join(',')}`;
+    const lsKey = bodyKey ?? `${repo.id}|${repo.gitVersion}|${opts.peel}|${opts.symrefs}|${opts.unborn}|${opts.prefixes.join(',')}`;
     const cachedLs = lsRefsCache.get(lsKey);
     if (cachedLs !== undefined) {
       sendBuffer(res, 200, 'application/x-git-upload-pack-result', cachedLs);
@@ -725,7 +766,7 @@ async function handleUploadPackV2(
       }
       // thin-pack / no-progress / ofs-delta / filter / deepen-since / deepen-not / done: accepted, ignored.
     }
-    const fetchKey = `${repo.id}|${repo.gitVersion}|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth}`;
+    const fetchKey = bodyKey ?? `${repo.id}|${repo.gitVersion}|${wants.join(',')}|${haves.join(',')}|${shallow.join(',')}|${depth}`;
     const cachedFetch = fetchResponseCache.get(fetchKey);
     if (cachedFetch !== undefined) {
       sendBuffer(res, 200, 'application/x-git-upload-pack-result', cachedFetch);

@@ -656,15 +656,15 @@ const LS_REFS_CACHE_MAX = 200;
 const ACK_SECTION_NAK: Buffer = pktLines(['acknowledgments\n', 'NAK\n', 'flush']);
 
 /**
- * Whole framed packfile sections, keyed by the memoized fetch plan object.
- * The section is a pure function of the plan's ordered object set (objects are
- * immutable), and the plan objects are the memoized ones, so the WeakMap entry
- * is exact; entries die with the plan, and the plan cache is bounded.
+ * Whole v2 fetch responses, keyed by the memoized fetch plan object. The
+ * response (acknowledgments + shallow-info + packfile sections) is a pure
+ * function of the plan — the plan memo key already includes the repo git
+ * version and the full arg set, and objects are immutable — so the cached
+ * response is exact. This subsumes the per-section caches: on a hit the fetch
+ * is one cache lookup + one send. Entries die with the plan; the plan cache
+ * is bounded.
  */
-const packSectionCache = new WeakMap<FetchPlan, Buffer>();
-
-/** Shallow-info sections, keyed by the memoized fetch plan (same rationale). */
-const shallowSectionCache = new WeakMap<FetchPlan, Buffer>();
+const fetchResponseCache = new WeakMap<FetchPlan, Buffer>();
 
 async function handleUploadPackV2(
   _req: IncomingMessage,
@@ -722,6 +722,11 @@ async function handleUploadPackV2(
       // thin-pack / no-progress / ofs-delta / filter / deepen-since / deepen-not / done: accepted, ignored.
     }
     const plan = planFetch(repo, wants, haves, shallow, depth);
+    const cachedResponse = fetchResponseCache.get(plan);
+    if (cachedResponse !== undefined) {
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cachedResponse);
+      return;
+    }
     const sections: Buffer[] = [];
     // acknowledgments (the no-haves NAK section is constant — prebuilt)
     if (haves.length === 0) {
@@ -737,34 +742,22 @@ async function handleUploadPackV2(
     }
     // shallow-info (only when this fetch is shallow-related)
     if (depth !== null || shallow.length > 0) {
-      let shallowSection = shallowSectionCache.get(plan);
-      if (shallowSection === undefined) {
-        const shallowLines: string[] = [];
-        for (const oid of plan.shallow) shallowLines.push(`shallow ${oid}\n`);
-        for (const oid of plan.unshallow) shallowLines.push(`unshallow ${oid}\n`);
-        shallowSection = pktLines(['shallow-info\n', ...shallowLines, 'flush']);
-        shallowSectionCache.set(plan, shallowSection);
-      }
-      sections.push(shallowSection);
+      const shallowLines: string[] = [];
+      for (const oid of plan.shallow) shallowLines.push(`shallow ${oid}\n`);
+      for (const oid of plan.unshallow) shallowLines.push(`unshallow ${oid}\n`);
+      sections.push(pktLines(['shallow-info\n', ...shallowLines, 'flush']));
     }
     // packfile (omitted entirely when nothing is delivered)
     if (plan.objects.size > 0) {
-      // The whole framed section (packfile header + sideband packets + flush) is a
-      // pure function of the ordered object set, and objects are immutable, so it
-      // is cached per fetch plan — this skips writePack, framing and concats
-      // on a hit (all 50 clones in a round fetch the identical 3-object set).
-      let section = packSectionCache.get(plan);
-      if (section === undefined) {
-        const pack = writePack(plan.objects.values());
-        const sb: Buffer[] = [pktLine('packfile\n')];
-        for (const packet of sidebandPackets(1, pack)) sb.push(packet);
-        sb.push(FLUSH);
-        section = Buffer.concat(sb);
-        packSectionCache.set(plan, section);
-      }
-      sections.push(section);
+      const pack = writePack(plan.objects.values());
+      const sb: Buffer[] = [pktLine('packfile\n')];
+      for (const packet of sidebandPackets(1, pack)) sb.push(packet);
+      sb.push(FLUSH);
+      sections.push(Buffer.concat(sb));
     }
-    sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(sections));
+    const response = Buffer.concat(sections);
+    fetchResponseCache.set(plan, response);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', response);
     return;
   }
   throw new Error(`unknown v2 command ${command}`);

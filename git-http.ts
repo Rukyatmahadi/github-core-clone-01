@@ -117,6 +117,20 @@ function sidebandPackets(band: number, data: Buffer): Buffer[] {
   return out;
 }
 
+/**
+ * Prebuilt sideband report for the common push case (push #2): one ok command on
+ * refs/heads/main with a successful unpack. Built once through the real builders,
+ * so the bytes are identical by construction; the handler uses it only when the
+ * report is exactly `unpack ok` + `ok refs/heads/main` + flush, sideband-wrapped.
+ */
+const FAST_SIDEBAND_REPORT_MAIN: Buffer = (() => {
+  const reportStream = pktLines(['unpack ok\n', 'ok refs/heads/main\n', 'flush']);
+  const parts: Buffer[] = [];
+  for (const packet of sidebandPackets(1, reportStream)) parts.push(packet);
+  parts.push(FLUSH);
+  return Buffer.concat(parts);
+})();
+
 // ---------------------------------------------------------------------------------------------
 // HTTP helpers
 
@@ -236,6 +250,44 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return pktLines(parts);
 }
 
+/**
+ * Receive-pack advertisement template (push #1). For a repo with exactly one ref
+ * (refs/heads/main, not a tag), the advertisement is fixed-length and only the
+ * 40-char tip oid varies (it appears twice: the HEAD line and the ref line).
+ * The template is built once from the real builder with a zero placeholder oid,
+ * so its bytes are identical by construction; per push we copy it and overwrite
+ * the two oid slots. Any other shape (0 refs, multi-ref, tag tip) falls back to
+ * the general builder.
+ */
+const RECEIVE_AD_TEMPLATE: { buffer: Buffer; oidOffsets: number[] } | null = (() => {
+  const fakeRepo = { refs: new Map([['refs/heads/main', ZERO_OID]]), objects: new Map() } as unknown as Repo;
+  const buf = v0Advertisement(fakeRepo, 'git-receive-pack');
+  const placeholder = Buffer.from(ZERO_OID, 'ascii');
+  const offsets: number[] = [];
+  let at = 0;
+  for (;;) {
+    const idx = buf.indexOf(placeholder, at);
+    if (idx === -1) break;
+    offsets.push(idx);
+    at = idx + placeholder.length;
+  }
+  if (offsets.length !== 2) return null;
+  return { buffer: buf, oidOffsets: offsets };
+})();
+
+function receivePackAdvertisement(repo: Repo): Buffer {
+  if (repo.refs.size === 1 && RECEIVE_AD_TEMPLATE !== null) {
+    const tip = repo.refs.get(HEAD_REF);
+    if (tip !== undefined && peelRef(repo, tip) === undefined) {
+      const { buffer, oidOffsets } = RECEIVE_AD_TEMPLATE;
+      const out = Buffer.from(buffer);
+      for (const off of oidOffsets) out.write(tip, off, 40, 'ascii');
+      return out;
+    }
+  }
+  return v0Advertisement(repo, 'git-receive-pack');
+}
+
 // ---------------------------------------------------------------------------------------------
 // v2 advertisement
 
@@ -251,6 +303,13 @@ function v2Advertisement(): Buffer {
     'flush',
   ]);
 }
+
+/**
+ * The v2 advertisement has no repo-dependent content (verified: the builder takes no
+ * repo argument), so one buffer built at module load serves every clone. It is never
+ * mutated after sendBuffer.
+ */
+const V2_ADVERTISEMENT = v2Advertisement();
 
 // ---------------------------------------------------------------------------------------------
 // Reachability / fetch planning
@@ -287,7 +346,7 @@ interface FetchPlan {
  *   are reported as unshallow.
  * - `depth` counts the want commit as depth 1; only commits within that depth are delivered.
  */
-function planFetch(
+function planFetchCompute(
   repo: Repo,
   wants: readonly string[],
   haves: readonly string[],
@@ -391,6 +450,33 @@ function planFetch(
   return { objects, shallow, unshallow };
 }
 
+/**
+ * Memoized planFetch (clone #2). A depth-1 clone re-walks the same tip commit + tree
+ * closure for an identical answer, so the plan is cached per (repo, git version,
+ * wants, haves, shallow boundaries, depth). The version counter in Repo bumps on
+ * every objects/refs mutation, so a cached plan can never be stale; objects are
+ * immutable once stored and callers only read the returned plan. Bounded: cleared
+ * past 500 entries.
+ */
+const planFetchCache = new Map<string, FetchPlan>();
+const PLAN_FETCH_CACHE_MAX = 500;
+
+function planFetch(
+  repo: Repo,
+  wants: readonly string[],
+  haves: readonly string[],
+  shallowBoundaries: readonly string[],
+  depth: number | null,
+): FetchPlan {
+  const key = `${repo.id}|${repo.gitVersion}|${wants.join(',')}|${haves.join(',')}|${shallowBoundaries.join(',')}|${depth}`;
+  const cached = planFetchCache.get(key);
+  if (cached !== undefined) return cached;
+  const plan = planFetchCompute(repo, wants, haves, shallowBoundaries, depth);
+  if (planFetchCache.size >= PLAN_FETCH_CACHE_MAX) planFetchCache.clear();
+  planFetchCache.set(key, plan);
+  return plan;
+}
+
 // ---------------------------------------------------------------------------------------------
 // v2 ls-refs
 
@@ -490,13 +576,13 @@ async function handleGitHttpInner(
     const service = query.get('service');
     if (service === 'git-upload-pack') {
       const isV2 = (req.headers['git-protocol'] ?? '') === 'version=2';
-      const body = isV2 ? v2Advertisement() : v0Advertisement(repo, 'git-upload-pack');
+      const body = isV2 ? V2_ADVERTISEMENT : v0Advertisement(repo, 'git-upload-pack');
       sendBuffer(res, 200, 'application/x-git-upload-pack-advertisement', body);
       return;
     }
     if (service === 'git-receive-pack') {
       // Receive-pack advertisement is always v0.
-      sendBuffer(res, 200, 'application/x-git-receive-pack-advertisement', v0Advertisement(repo, 'git-receive-pack'));
+      sendBuffer(res, 200, 'application/x-git-receive-pack-advertisement', receivePackAdvertisement(repo));
       return;
     }
     sendJson(res, 404, { message: 'Not Found' });
@@ -528,6 +614,18 @@ async function handleGitHttpInner(
 // ---------------------------------------------------------------------------------------------
 // upload-pack v2 (ls-refs / fetch)
 
+/**
+ * Serialized ls-refs responses, keyed by the full arg set plus the repo git version
+ * (clone #4). The clone workload's ls-refs returns the same body for all 50 clones;
+ * the version bump on any refs/objects mutation keeps the cache exact. Bounded.
+ */
+const lsRefsCache = new Map<string, Buffer>();
+const LS_REFS_CACHE_MAX = 200;
+
+/** Whole framed packfile sections, keyed by the ordered oid set (clone #1). */
+const packSectionCache = new Map<string, Buffer>();
+const PACK_SECTION_CACHE_MAX = 200;
+
 async function handleUploadPackV2(
   _req: IncomingMessage,
   res: ServerResponse,
@@ -543,6 +641,12 @@ async function handleUploadPackV2(
       else if (arg === 'unborn') opts.unborn = true;
       else if (arg.startsWith('ref-prefix ')) opts.prefixes.push(arg.slice('ref-prefix '.length));
     }
+    const lsKey = `${repo.id}|${repo.gitVersion}|${opts.peel}|${opts.symrefs}|${opts.unborn}|${opts.prefixes.join(',')}`;
+    const cachedLs = lsRefsCache.get(lsKey);
+    if (cachedLs !== undefined) {
+      sendBuffer(res, 200, 'application/x-git-upload-pack-result', cachedLs);
+      return;
+    }
     const lines = lsRefsLines(repo, opts);
     const parts: (string | 'flush')[] = [];
     for (const line of lines) {
@@ -556,7 +660,10 @@ async function handleUploadPackV2(
       }
     }
     parts.push('flush');
-    sendBuffer(res, 200, 'application/x-git-upload-pack-result', pktLines(parts));
+    const lsBody = pktLines(parts);
+    if (lsRefsCache.size >= LS_REFS_CACHE_MAX) lsRefsCache.clear();
+    lsRefsCache.set(lsKey, lsBody);
+    sendBuffer(res, 200, 'application/x-git-upload-pack-result', lsBody);
     return;
   }
   if (command === 'fetch') {
@@ -597,11 +704,22 @@ async function handleUploadPackV2(
     }
     // packfile (omitted entirely when nothing is delivered)
     if (plan.objects.size > 0) {
-      const pack = writePack(plan.objects.values());
-      const sb: Buffer[] = [pktLine('packfile\n')];
-      for (const packet of sidebandPackets(1, pack)) sb.push(packet);
-      sb.push(FLUSH);
-      sections.push(Buffer.concat(sb));
+      // The whole framed section (packfile header + sideband packets + flush) is a
+      // pure function of the ordered object set, and objects are immutable, so it
+      // is cached per ordered oid list — this skips writePack, framing and concats
+      // on a hit (all 50 clones in a round fetch the identical 3-object set).
+      const packKey = [...plan.objects.keys()].join(',');
+      let section = packSectionCache.get(packKey);
+      if (section === undefined) {
+        const pack = writePack(plan.objects.values());
+        const sb: Buffer[] = [pktLine('packfile\n')];
+        for (const packet of sidebandPackets(1, pack)) sb.push(packet);
+        sb.push(FLUSH);
+        section = Buffer.concat(sb);
+        if (packSectionCache.size >= PACK_SECTION_CACHE_MAX) packSectionCache.clear();
+        packSectionCache.set(packKey, section);
+      }
+      sections.push(section);
     }
     sendBuffer(res, 200, 'application/x-git-upload-pack-result', Buffer.concat(sections));
     return;
@@ -667,6 +785,47 @@ interface PushCommand {
   ref: string;
 }
 
+function isHexByte(b: number): boolean {
+  return (b >= 0x30 && b <= 0x39) || (b >= 0x61 && b <= 0x66);
+}
+
+/**
+ * Fast-path parse of one receive-pack command packet (push #3), or null to use the
+ * general parser. Accepts exactly one line of shape
+ * "<40 lowercase hex> <40 lowercase hex> <ref>" followed by "\n" or
+ * "\0<caps>\n" and nothing else; the ref must contain no space or non-ASCII byte.
+ * Anything else (multi-line packets, missing newline, uppercase oids, odd refs)
+ * falls back, so behavior is unchanged.
+ */
+function parseReceiveCommandFast(raw: Buffer): { command: PushCommand; caps: string } | null {
+  if (raw.length < 84) return null; // 40 + 1 + 40 + 1 + >=1 ref char + "\n"
+  if (raw[40] !== 0x20 || raw[81] !== 0x20) return null;
+  for (let i = 0; i < 40; i += 1) if (!isHexByte(raw[i] as number)) return null;
+  for (let i = 41; i < 81; i += 1) if (!isHexByte(raw[i] as number)) return null;
+  let refEnd = -1;
+  let nul = -1;
+  for (let i = 82; i < raw.length; i += 1) {
+    const b = raw[i] as number;
+    if (b === 0x00) { nul = i; refEnd = i; break; }
+    if (b === 0x0a) { refEnd = i; break; }
+    if (b === 0x20 || b >= 0x80) return null;
+  }
+  if (refEnd === -1) return null;
+  const ref = raw.subarray(82, refEnd).toString('ascii');
+  if (ref === '') return null;
+  const command: PushCommand = {
+    oldOid: raw.subarray(0, 40).toString('ascii'),
+    newOid: raw.subarray(41, 81).toString('ascii'),
+    ref,
+  };
+  if (nul === -1) {
+    if (refEnd !== raw.length - 1) return null;
+    return { command, caps: '' };
+  }
+  if (raw[raw.length - 1] !== 0x0a) return null;
+  return { command, caps: raw.subarray(nul + 1, raw.length - 1).toString('utf8') };
+}
+
 async function handleReceivePack(res: ServerResponse, repo: Repo, body: Buffer): Promise<void> {
   const { packets, consumed } = decodePktsToFlush(body);
   const packBytes = body.subarray(consumed);
@@ -675,6 +834,16 @@ async function handleReceivePack(res: ServerResponse, repo: Repo, body: Buffer):
   let reportV2 = false;
   for (const packet of packets) {
     if (packet.kind !== 'data') continue;
+    const fast = parseReceiveCommandFast(packet.payload);
+    if (fast !== null) {
+      if (fast.caps !== '') {
+        const tokens = fast.caps.trim().split(/\s+/);
+        if (tokens.includes('side-band-64k')) sideband = true;
+        if (tokens.includes('report-status-v2')) reportV2 = true;
+      }
+      commands.push(fast.command);
+      continue;
+    }
     let line = packet.payload.toString('utf8');
     let caps = '';
     const nul = line.indexOf('\0');
@@ -784,6 +953,17 @@ async function handleReceivePack(res: ServerResponse, repo: Repo, body: Buffer):
     results.push({ ref: cmd.ref, ok: true, reason: '' });
   }
 
+  // A push may have stored objects or changed refs; bump the git version so the
+  // planFetch / ls-refs caches re-derive (a spurious bump only costs a cache miss).
+  repo.gitVersion += 1;
+
+  // Fast path: the single-ok-command sideband report, prebuilt (push #2).
+  const onlyResult = results.length === 1 ? results[0] : undefined;
+  if (sideband && unpackOk && onlyResult !== undefined && onlyResult.ok && onlyResult.ref === 'refs/heads/main') {
+    sendBuffer(res, 200, 'application/x-git-receive-pack-result', FAST_SIDEBAND_REPORT_MAIN);
+    return;
+  }
+
   const reportLines: string[] = [`unpack ${unpackDetail}\n`];
   for (const r of results) {
     reportLines.push(r.ok ? `ok ${r.ref}\n` : `ng ${r.ref} ${r.reason}\n`);
@@ -804,6 +984,13 @@ async function handleReceivePack(res: ServerResponse, repo: Repo, body: Buffer):
 /** True when `ancestor` is reachable from `descendant` following commit parents. */
 function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
+  // Fast path (push #6): linear single-parent case — the new commit's only parent
+  // is the old tip, so fast-forward holds without the walk setup.
+  const head = repo.objects.get(descendant);
+  if (head !== undefined && head.type === 'commit') {
+    const parents = parseCommit(head.data).parents;
+    if (parents.length === 1 && parents[0] === ancestor) return true;
+  }
   const seen = new Set<string>();
   const stack = [descendant];
   while (stack.length > 0) {

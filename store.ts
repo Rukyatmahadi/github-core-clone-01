@@ -14,11 +14,40 @@ export const STORE_EPOCH_SEC = 1_735_689_600;
  * formatted on every render of the same repo/issue/pull, so repeat calls are free. */
 const isoCache = new Map<number, string>();
 
+const pad2 = (n: number): string => (n < 10 ? `0${n}` : `${n}`);
+
+/**
+ * Format a sequence as an ISO-8601 UTC timestamp (deterministic), byte-identical to
+ * `new Date((STORE_EPOCH_SEC + seq) * 1000).toISOString()` with the millis stripped.
+ * Integer civil-from-days arithmetic (Howard Hinnant's algorithm) — no Date, no regex.
+ * Verified offline against the Date implementation over seqs 0..300,000 plus day/year/
+ * leap boundaries and large values (see /tmp/r4-verify-iso.mjs): zero mismatches.
+ */
+function isoAtFast(seq: number): string {
+  const total = STORE_EPOCH_SEC + seq;
+  const days = Math.floor(total / 86400);
+  const secs = total - days * 86400;
+  const z = days + 719468;
+  const era = Math.floor(z / 146097);
+  const doe = z - era * 146097;
+  const yoe = Math.floor((doe - Math.floor(doe / 1460) + Math.floor(doe / 36524) - Math.floor(doe / 146096)) / 365);
+  const y = yoe + era * 400;
+  const doy = doe - (365 * yoe + Math.floor(yoe / 4) - Math.floor(yoe / 100));
+  const mp = Math.floor((5 * doy + 2) / 153);
+  const d = doy - Math.floor((153 * mp + 2) / 5) + 1;
+  const m = mp + (mp < 10 ? 3 : -9);
+  const year = y + (m <= 2 ? 1 : 0);
+  const hh = Math.floor(secs / 3600);
+  const mm = Math.floor((secs % 3600) / 60);
+  const ss = secs % 60;
+  return `${year}-${pad2(m)}-${pad2(d)}T${pad2(hh)}:${pad2(mm)}:${pad2(ss)}Z`;
+}
+
 /** Format a sequence as an ISO-8601 UTC timestamp (deterministic). */
 export function isoAt(seq: number): string {
   const cached = isoCache.get(seq);
   if (cached !== undefined) return cached;
-  const text = new Date((STORE_EPOCH_SEC + seq) * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+  const text = isoAtFast(seq);
   if (isoCache.size > 10000) isoCache.clear();
   isoCache.set(seq, text);
   return text;
@@ -56,6 +85,12 @@ export interface Issue {
   comments: Comment[];
   createdSeq: number;
   closedSeq: number | null;
+  /**
+   * Bumped on every mutation of a field the REST issue fingerprint renders
+   * (title/body/state/closedSeq/comments) — see app.ts issueFingerprint memo.
+   * Label names/colors never change after creation, so they need no bump.
+   */
+  fpVersion: number;
 }
 
 export interface PullFile {
@@ -104,6 +139,29 @@ export interface Repo {
   nextLabelId: number;
   /** files changed by each open PR's head vs its base (computed at PR creation, refreshed on merge). */
   pullFiles: Map<number, PullFile[]>;
+  /**
+   * Bumped on every mutation of `objects` or `refs` (putObject, commitFileChange,
+   * mergePull, receive-pack, git/refs POST). Caches keyed on the git state
+   * (planFetch memo, ls-refs serialization, advertisements) include this version.
+   */
+  gitVersion: number;
+}
+
+const B64URL_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+
+/** base64url without padding — byte-identical to Buffer.toString('base64url'). */
+function base64urlEncode(bytes: Buffer): string {
+  let out = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const b0 = bytes[i] as number;
+    const b1 = i + 1 < bytes.length ? (bytes[i + 1] as number) : 0;
+    const b2 = i + 2 < bytes.length ? (bytes[i + 2] as number) : 0;
+    out += B64URL_ALPHABET[b0 >> 2];
+    out += B64URL_ALPHABET[((b0 & 0x03) << 4) | (b1 >> 4)];
+    if (i + 1 < bytes.length) out += B64URL_ALPHABET[((b1 & 0x0f) << 2) | (b2 >> 6)];
+    if (i + 2 < bytes.length) out += B64URL_ALPHABET[b2 & 0x3f];
+  }
+  return out;
 }
 
 /** Global GraphQL ids: opaque base64url of a typed tag the server can decode. */
@@ -111,7 +169,7 @@ export function repoGlobalId(owner: string, name: string): string {
   return Buffer.from(`Repository:${owner}/${name}`, 'utf8').toString('base64url');
 }
 export function issueGlobalId(owner: string, name: string, number: number): string {
-  return Buffer.from(`Issue:${owner}/${name}#${number}`, 'utf8').toString('base64url');
+  return base64urlEncode(Buffer.from(`Issue:${owner}/${name}#${number}`, 'utf8'));
 }
 export function pullGlobalId(owner: string, name: string, number: number): string {
   return Buffer.from(`PullRequest:${owner}/${name}#${number}`, 'utf8').toString('base64url');
@@ -175,6 +233,7 @@ export class Store {
       nextPullNumber: 1,
       nextLabelId: 1,
       pullFiles: new Map(),
+      gitVersion: 0,
     };
     this.nextRepoId += 1;
     this.repos.set(this.key(owner, name), repo);
@@ -201,7 +260,10 @@ export class Store {
 
   putObject(repo: Repo, type: GitObjectType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!repo.objects.has(oid)) repo.objects.set(oid, { type, data });
+    if (!repo.objects.has(oid)) {
+      repo.objects.set(oid, { type, data });
+      repo.gitVersion += 1;
+    }
     return oid;
   }
 
@@ -424,6 +486,7 @@ export class Store {
     });
     const commitSha = this.putObject(repo, 'commit', commitData);
     repo.refs.set(ref, commitSha);
+    repo.gitVersion += 1;
     return { commitSha, contentSha };
   }
 
@@ -450,6 +513,7 @@ export class Store {
       comments: [],
       createdSeq: this.nextSeq(),
       closedSeq: null,
+      fpVersion: 0,
     };
     this.nextObjectId += 1;
     repo.nextIssueNumber += 1;
@@ -474,6 +538,7 @@ export class Store {
     const comment: Comment = { id: this.nextCommentId, body, createdSeq: this.nextSeq() };
     this.nextCommentId += 1;
     issue.comments.push(comment);
+    issue.fpVersion += 1;
     return comment;
   }
 
@@ -612,6 +677,7 @@ export class Store {
     });
     const mergeSha = this.putObject(repo, 'commit', commitData);
     repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+    repo.gitVersion += 1;
     pull.state = 'closed';
     pull.merged = true;
     pull.mergeCommitSha = mergeSha;

@@ -299,6 +299,9 @@ export interface PackReadResult {
   count: number;
 }
 
+/** Pack object type numbers (hoisted: the literal was rebuilt on every readPack entry). */
+const PACK_TYPE_NAMES: Record<number, GitObjectType | 'ofs' | 'ref'> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag', 6: 'ofs', 7: 'ref' };
+
 /**
  * Read a packfile (version 2) and resolve every object, including OFS_DELTA and REF_DELTA.
  * `resolveBase` is consulted for REF_DELTA bases not present in the pack itself (the server's
@@ -310,17 +313,19 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
   const count = pack.readUInt32BE(8);
   const objects = new Map<string, GitObject>();
-  const byOffset = new Map<number, GitObject>();
+  // Whole-object entry offsets, kept in parallel arrays instead of a Map: the offset
+  // map is only needed when a delta entry exists, so it is built lazily below.
+  const entryOffsets: number[] = [];
+  const entryObjects: GitObject[] = [];
   let pos = 12;
   // First pass: read all entries, resolving deltas whose base is already known; queue the rest.
   interface Pending { offset: number; type: 'ofs' | 'ref'; baseOffset?: number; baseOid?: string; data: Buffer; }
-  const pending: Pending[] = [];
+  let pending: Pending[] | null = null;
   for (let i = 0; i < count; i += 1) {
     const entryOffset = pos;
     const { typeNum, size, next: afterSize } = readPackObjectHeader(pack, pos);
     pos = afterSize;
-    const TYPE_NAMES: Record<number, GitObjectType | 'ofs' | 'ref'> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag', 6: 'ofs', 7: 'ref' };
-    const kind = TYPE_NAMES[typeNum];
+    const kind = PACK_TYPE_NAMES[typeNum];
     if (kind === undefined) throw new Error(`unknown pack object type ${typeNum}`);
     if (kind === 'ofs' || kind === 'ref') {
       let baseOffset: number | undefined;
@@ -335,7 +340,7 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
       }
       const { data, next } = inflateAt(pack, pos);
       pos = next;
-      pending.push({ offset: entryOffset, type: kind, baseOffset, baseOid, data });
+      (pending ??= []).push({ offset: entryOffset, type: kind, baseOffset, baseOid, data });
       void size;
     } else {
       const { data, next } = inflateAt(pack, pos);
@@ -344,28 +349,33 @@ export function readPack(pack: Buffer, options: { resolveBase?: (oid: string) =>
       const oid = hashObject(kind, data);
       const obj: GitObject = { type: kind, data };
       objects.set(oid, obj);
-      byOffset.set(entryOffset, obj);
+      entryOffsets.push(entryOffset);
+      entryObjects.push(obj);
     }
   }
   // Resolve pending deltas (possibly chained): iterate until no progress.
-  let remaining = pending;
-  while (remaining.length > 0) {
-    const nextRound: Pending[] = [];
-    let progressed = false;
-    for (const item of remaining) {
-      let base: GitObject | undefined;
-      if (item.type === 'ofs') base = byOffset.get(item.baseOffset as number);
-      else base = objects.get(item.baseOid as string) ?? options.resolveBase?.(item.baseOid as string);
-      if (base === undefined) { nextRound.push(item); continue; }
-      const data = applyDelta(base.data, item.data);
-      const oid = hashObject(base.type, data);
-      const obj: GitObject = { type: base.type, data };
-      objects.set(oid, obj);
-      byOffset.set(item.offset, obj);
-      progressed = true;
+  let remaining = pending ?? [];
+  if (remaining.length > 0) {
+    const byOffset = new Map<number, GitObject>();
+    for (let i = 0; i < entryOffsets.length; i += 1) byOffset.set(entryOffsets[i] as number, entryObjects[i] as GitObject);
+    while (remaining.length > 0) {
+      const nextRound: Pending[] = [];
+      let progressed = false;
+      for (const item of remaining) {
+        let base: GitObject | undefined;
+        if (item.type === 'ofs') base = byOffset.get(item.baseOffset as number);
+        else base = objects.get(item.baseOid as string) ?? options.resolveBase?.(item.baseOid as string);
+        if (base === undefined) { nextRound.push(item); continue; }
+        const data = applyDelta(base.data, item.data);
+        const oid = hashObject(base.type, data);
+        const obj: GitObject = { type: base.type, data };
+        objects.set(oid, obj);
+        byOffset.set(item.offset, obj);
+        progressed = true;
+      }
+      if (!progressed) throw new Error('pack delta base not found in pack or store');
+      remaining = nextRound;
     }
-    if (!progressed) throw new Error('pack delta base not found in pack or store');
-    remaining = nextRound;
   }
   return { objects, count };
 }

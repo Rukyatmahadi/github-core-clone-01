@@ -153,7 +153,11 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
 }
 
 function sendBuffer(res: ServerResponse, status: number, contentType: string, body: Buffer): void {
-  res.writeHead(status, { 'content-type': contentType, 'content-length': body.length });
+  // setHeader + end instead of a writeHead object literal: identical bytes on the
+  // wire, but no fresh header object per response (same change as app.ts sendBuffer).
+  res.statusCode = status;
+  res.setHeader('content-type', contentType);
+  res.setHeader('content-length', body.length);
   res.end(body);
 }
 

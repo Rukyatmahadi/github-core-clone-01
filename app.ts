@@ -49,12 +49,13 @@ let requestSeq = 0;
 
 function sendText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
   requestSeq += 1;
-  res.writeHead(status, {
-    'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
-    'x-github-request-id': `req-${requestSeq}`,
-    ...headers,
-  });
+  // setHeader + end instead of a writeHead object literal (same change as
+  // sendBuffer): identical bytes on the wire, no fresh header object per reply.
+  res.statusCode = status;
+  res.setHeader('content-type', JSON_TYPE);
+  res.setHeader('content-length', Buffer.byteLength(text));
+  res.setHeader('x-github-request-id', `req-${requestSeq}`);
+  for (const [name, value] of Object.entries(headers)) res.setHeader(name, value);
   res.end(text);
 }
 

@@ -185,13 +185,21 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
   res.end(text);
 }
 
-function isAuthenticated(req: IncomingMessage): boolean {
+/**
+ * Auth fast-path: MAKEFUN_SHOP_TOKEN never changes during the process, so the
+ * expected `Authorization` header is precomputed once (same change as app.ts).
+ * Outcome-identical to the regex path (which also ends in `token === expected`).
+ */
+const EXPECTED_AUTH_HEADER: string | null = (() => {
   const expected = process.env.MAKEFUN_SHOP_TOKEN ?? '';
-  if (expected === '') return true;
+  return expected === '' ? null : `Bearer ${expected}`;
+})();
+
+function isAuthenticated(req: IncomingMessage): boolean {
+  if (EXPECTED_AUTH_HEADER === null) return true; // no token configured: everything passes (as before)
   const header = req.headers.authorization;
   if (typeof header !== 'string') return false;
-  const match = /^Bearer (.+)$/.exec(header);
-  return match !== null && (match[1] as string) === expected;
+  return header === EXPECTED_AUTH_HEADER;
 }
 
 // ---------------------------------------------------------------------------------------------

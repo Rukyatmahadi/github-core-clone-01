@@ -220,7 +220,9 @@ const EXPECTED_AUTH_HEADER: string | null = (() => {
 function isAuthenticated(req: IncomingMessage): boolean {
   const header = req.headers.authorization;
   if (typeof header !== 'string') return false;
-  if (EXPECTED_AUTH_HEADER === null) return true; // local dev without a token set: any bearer passes
+  // Local dev without a token set: any Bearer token passes (the old regex path
+  // required the `Bearer <non-empty>` shape — preserved exactly here).
+  if (EXPECTED_AUTH_HEADER === null) return header.length > 7 && header.startsWith('Bearer ');
   return header === EXPECTED_AUTH_HEADER;
 }
 

@@ -110,6 +110,9 @@ function pathSegments(url: URL): string[] {
   }
 }
 
+/** Shared empty query params: no caller mutates the query object (only .get reads). */
+const EMPTY_QUERY = new URLSearchParams();
+
 /**
  * Fast-path URL parsing for REST routes (write #1): split req.url on '/' by hand
  * and skip decodeURIComponent entirely (no '%' survives the guard below). Falls
@@ -126,7 +129,7 @@ function fastUrl(req: IncomingMessage): { segments: string[]; query: URLSearchPa
   const path = q === -1 ? raw : raw.slice(0, q);
   const segments = path.split('/').filter((part) => part !== '');
   if (segments.includes('.') || segments.includes('..')) return null;
-  return { segments, query: new URLSearchParams(q === -1 ? '' : raw.slice(q + 1)) };
+  return { segments, query: q === -1 ? EMPTY_QUERY : new URLSearchParams(raw.slice(q + 1)) };
 }
 
 /**
@@ -150,7 +153,7 @@ function fastReadShape(req: IncomingMessage): { segments: string[]; query: URLSe
   if (owner === '.' || owner === '..' || repo === '.' || repo === '..') return null;
   const number = Number.parseInt(n, 10);
   if (!Number.isSafeInteger(number) || number < 1) return null;
-  return { segments: ['api', 'v3', 'repos', owner, repo, 'issues', n], query: new URLSearchParams() };
+  return { segments: ['api', 'v3', 'repos', owner, repo, 'issues', n], query: EMPTY_QUERY };
 }
 
 /**

@@ -135,7 +135,7 @@ function fastUrl(req: IncomingMessage): { segments: string[]; query: URLSearchPa
  */
 function fastReadShape(req: IncomingMessage): { segments: string[]; query: URLSearchParams } | null {
   const raw = req.url ?? '/';
-  if (raw.includes('%') || raw.includes('?') || raw.includes('#')) return null;
+  if (raw.includes('%') || raw.includes('?') || raw.includes('#') || raw.includes('\\') || /[^\x20-\x7E]/.test(raw)) return null;
   const parts = raw.split('/');
   // ['', 'api', 'v3', 'repos', owner, repo, 'issues', n]
   if (parts.length !== 8) return null;
@@ -144,21 +144,29 @@ function fastReadShape(req: IncomingMessage): { segments: string[]; query: URLSe
   const repo = parts[5] as string;
   const n = parts[7] as string;
   if (owner === '' || repo === '' || n === '' || !/^\d+$/.test(n)) return null;
+  // Dot segments / backslashes would be normalized away by the URL parser into
+  // different segments, so they must fall back to the general path.
+  if (owner === '.' || owner === '..' || repo === '.' || repo === '..') return null;
   const number = Number.parseInt(n, 10);
   if (!Number.isSafeInteger(number) || number < 1) return null;
   return { segments: ['api', 'v3', 'repos', owner, repo, 'issues', n], query: new URLSearchParams() };
 }
 
-/** Parse the request URL: read fast-path, then the general fast path, then `new URL`. */
-function parseRequestUrl(req: IncomingMessage, method: string): { segments: string[]; query: URLSearchParams } {
+/**
+ * Parse the request URL: read fast-path, then the general fast path, then `new URL`.
+ * `readShape` is true only when the read fast-path matched (GET
+ * /api/v3/repos/{owner}/{repo}/issues/{n}, no query/encoding) — handleRequest
+ * uses it to jump straight to the issue getter.
+ */
+function parseRequestUrl(req: IncomingMessage, method: string): { segments: string[]; query: URLSearchParams; readShape: boolean } {
   if (method === 'GET') {
     const read = fastReadShape(req);
-    if (read !== null) return read;
+    if (read !== null) return { segments: read.segments, query: read.query, readShape: true };
   }
   const fast = fastUrl(req);
-  if (fast !== null) return fast;
+  if (fast !== null) return { segments: fast.segments, query: fast.query, readShape: false };
   const url = requestUrl(req);
-  return { segments: pathSegments(url), query: url.searchParams };
+  return { segments: pathSegments(url), query: url.searchParams, readShape: false };
 }
 
 /** Read the whole request body (up to MAX_BODY_BYTES). */
@@ -473,9 +481,46 @@ function lookupRepo(res: ServerResponse, segments: string[], ownerIdx: number): 
   return repo;
 }
 
+/** Serve GET /repos/{o}/{r}/issues/{n} (cached body when the fingerprint hits). */
+function serveIssueGet(res: ServerResponse, repo: Repo, issue: Issue): void {
+  const key = memoizedIssueFingerprint(repo, issue);
+  const cached = issueJsonCache.get(key);
+  if (cached !== undefined) {
+    sendBuffer(res, 200, cached);
+    return;
+  }
+  const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
+  if (issueJsonCache.size > 5000) issueJsonCache.clear();
+  issueJsonCache.set(key, body);
+  sendBuffer(res, 200, body);
+}
+
 async function handleRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  const { segments, query } = parseRequestUrl(req, method);
+  const { segments, query, readShape } = parseRequestUrl(req, method);
+
+  // Read fast-path: the read workload's exact shape jumps straight to the issue
+  // getter, skipping the dispatch frames (healthz/git/graphql/mcp/api-root/
+  // meta/user/repos routing, body read, handleRepoRoutes/handleIssues). Auth,
+  // repo lookup and issue lookup behave exactly as the general path.
+  if (readShape) {
+    if (!isAuthenticated(req)) {
+      unauthorized(res);
+      return;
+    }
+    const repo = store.getRepo(segments[3] as string, segments[4] as string);
+    if (repo === undefined) {
+      notFound(res, 'Not Found');
+      return;
+    }
+    const issue = store.getIssue(repo, Number.parseInt(segments[6] as string, 10));
+    if (issue === undefined) {
+      notFound(res, 'Not Found');
+      return;
+    }
+    serveIssueGet(res, repo, issue);
+    return;
+  }
 
   // Health probe: no auth.
   if (method === 'GET' && segments.length === 1 && segments[0] === 'healthz') {
@@ -932,16 +977,7 @@ async function handleIssues(
   // /issues/{n}
   if (tail.length === 1) {
     if (method === 'GET') {
-      const key = memoizedIssueFingerprint(repo, issue);
-      const cached = issueJsonCache.get(key);
-      if (cached !== undefined) {
-        sendBuffer(res, 200, cached);
-        return;
-      }
-      const body = Buffer.from(`${JSON.stringify(issueJson(repo, issue))}\n`, 'utf8');
-      if (issueJsonCache.size > 5000) issueJsonCache.clear();
-      issueJsonCache.set(key, body);
-      sendBuffer(res, 200, body);
+      serveIssueGet(res, repo, issue);
       return;
     }
     if (method === 'PATCH') {

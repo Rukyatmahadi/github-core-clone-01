@@ -153,17 +153,35 @@ const FAST_SIDEBAND_REPORT_MAIN: Buffer = (() => {
 // HTTP helpers
 
 function readBody(req: IncomingMessage): Promise<Buffer> {
+  // Fast path (read+push #2): on loopback the body usually arrives with the
+  // headers, so drain whatever is already buffered synchronously instead of
+  // waiting two event-loop turns for 'data'/'end'. Falls back to listeners
+  // when nothing (or not everything) is buffered yet — identical bytes.
+  const chunks: Buffer[] = [];
+  let total = 0;
+  const pushChunk = (chunk: Buffer): boolean => {
+    total += chunk.length;
+    if (total > 8 * 1024 * 1024) return false;
+    chunks.push(chunk);
+    return true;
+  };
+  let chunk: Buffer | null;
+  while ((chunk = req.read() as Buffer | null) !== null) {
+    if (!pushChunk(chunk)) {
+      req.destroy();
+      return Promise.reject(new Error('request body too large'));
+    }
+  }
+  if (req.complete) {
+    return Promise.resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks));
+  }
   return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    req.on('data', (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > 8 * 1024 * 1024) {
+    req.on('data', (c: Buffer) => {
+      if (!pushChunk(c)) {
         reject(new Error('request body too large'));
         req.destroy();
         return;
       }
-      chunks.push(chunk);
     });
     req.on('end', () => resolve(chunks.length === 1 ? (chunks[0] as Buffer) : Buffer.concat(chunks)));
     req.on('error', reject);
